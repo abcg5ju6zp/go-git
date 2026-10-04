@@ -523,3 +523,115 @@ func TestSyncedReaderNoLostWakeup(t *testing.T) {
 		require.NoError(t, fw.Close())
 	}
 }
+
+// packBytes returns the contents of f's packfile.
+func packBytes(t *testing.T, f *fixtures.Fixture) []byte {
+	t.Helper()
+
+	pf, err := f.Packfile()
+	require.NoError(t, err)
+	data, err := io.ReadAll(pf)
+	require.NoError(t, err)
+	return data
+}
+
+// assertNoPackFiles checks that objects/pack holds nothing, temporary files
+// included.
+func assertNoPackFiles(t *testing.T, fs billy.Filesystem) {
+	t.Helper()
+
+	entries, err := fs.ReadDir("objects/pack")
+	require.NoError(t, err)
+	for _, e := range entries {
+		t.Errorf("objects/pack/%s left behind", e.Name())
+	}
+}
+
+// TestPackWriterWriteInvalidCleansUp checks that a pack that fails to parse
+// does not leave its temporary file behind.
+func TestPackWriterWriteInvalidCleansUp(t *testing.T) {
+	t.Parallel()
+
+	data := packBytes(t, fixtures.Basic().One())
+	tests := map[string][]byte{
+		"truncated":     data[:len(data)/2],
+		"bad signature": []byte("KCAP\x00\x00\x00\x02\x00\x00\x00\x00"),
+	}
+
+	for name, pack := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fs := osfs.New(t.TempDir())
+			w, err := New(fs).NewObjectPack()
+			require.NoError(t, err)
+
+			_, err = w.Write(pack)
+			require.NoError(t, err)
+			require.Error(t, w.Close())
+
+			assertNoPackFiles(t, fs)
+		})
+	}
+}
+
+var errInjected = errors.New("injected failure")
+
+// failingFS fails Create for paths ending in createSuffix, and Rename onto
+// a .pack when failRename is set.
+type failingFS struct {
+	billy.Filesystem
+	createSuffix string
+	failRename   bool
+}
+
+func (fs *failingFS) Create(name string) (billy.File, error) {
+	if fs.createSuffix != "" && strings.HasSuffix(name, fs.createSuffix) {
+		return nil, errInjected
+	}
+	return fs.Filesystem.Create(name)
+}
+
+func (fs *failingFS) Rename(from, to string) error {
+	if fs.failRename && strings.HasSuffix(to, ".pack") {
+		return errInjected
+	}
+	return fs.Filesystem.Rename(from, to)
+}
+
+// TestPackWriterSaveFailureCleansUp checks that a pack that parses but fails
+// to save leaves nothing behind: not the temporary pack, nor the index,
+// reverse index or marker written for it.
+func TestPackWriterSaveFailureCleansUp(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]failingFS{
+		"create idx":      {createSuffix: ".idx"},
+		"create rev":      {createSuffix: ".rev"},
+		"create promisor": {createSuffix: promisorExt},
+		"rename":          {failRename: true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			fs := &failingFS{
+				Filesystem:   osfs.New(t.TempDir()),
+				createSuffix: tc.createSuffix,
+				failRename:   tc.failRename,
+			}
+			dot := NewWithOptions(fs, Options{WriteReverseIndex: true})
+			require.NoError(t, dot.Initialize())
+
+			w, err := dot.NewPromisorObjectPack("")
+			require.NoError(t, err)
+
+			_, err = w.Write(packBytes(t, fixtures.Basic().One()))
+			require.NoError(t, err)
+			require.ErrorIs(t, w.Close(), errInjected)
+
+			assertNoPackFiles(t, fs)
+		})
+	}
+}
