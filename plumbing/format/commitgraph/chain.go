@@ -83,17 +83,23 @@ func OpenChainIndex(fs billy.Filesystem) (Index, error) {
 	for _, hash := range chain {
 		file, err := fs.Open(path.Join("objects", "info", "commit-graphs", "graph-"+hash+".graph"))
 		if err != nil {
-			// Ignore all other file closing errors and return the error from opening the last file in the graph
-			_ = index.Close()
+			// Ignore closing errors and return the error from opening the file instead
+			if index != nil {
+				_ = index.Close()
+			}
 			return nil, err
 		}
 
-		index, err = OpenFileIndexWithParent(file, index)
+		next, err := OpenFileIndexWithParent(file, index)
 		if err != nil {
-			// Ignore file closing errors and return the error from OpenFileIndex instead
-			_ = index.Close()
+			// Ignore closing errors and return the error from OpenFileIndexWithParent instead
+			_ = file.Close()
+			if index != nil {
+				_ = index.Close()
+			}
 			return nil, err
 		}
+		index = next
 	}
 
 	return index, nil
