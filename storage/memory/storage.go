@@ -34,6 +34,7 @@ type Storage struct {
 	ReferenceStorage
 	ModuleStorage
 	ReflogStorage
+	SequenceStorage
 	options options
 }
 
@@ -60,6 +61,7 @@ func NewStorage(o ...StorageOption) *Storage {
 		ReflogStorage: ReflogStorage{
 			entries: make(map[plumbing.ReferenceName][]*reflog.Entry),
 		},
+		SequenceStorage: make(SequenceStorage),
 	}
 
 	if opts.objectFormat != formatcfg.UnsetObjectFormat {

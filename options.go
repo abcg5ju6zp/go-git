@@ -134,6 +134,13 @@ const (
 
 	// OursMergeStrategy is a merge strategy option that auto-resolves the changes by accepting our version of the changes and rejecting the incoming changes.
 	OursMergeStrategy
+
+	// DefaultMergeStrategy performs a regular three-way merge. Changes that
+	// do not overlap are applied automatically; when both sides changed the
+	// same content, the cherry-pick stops with conflict stages recorded in
+	// the index, leaving the worktree ready for manual resolution. It
+	// resembles `git cherry-pick` without a `-X theirs|ours` option.
+	DefaultMergeStrategy
 )
 
 // Validate validates the fields and sets the default values.
@@ -552,6 +559,36 @@ type LogOptions struct {
 
 // ErrMissingAuthor is returned when the author field is required but not provided.
 var ErrMissingAuthor = errors.New("author field is required")
+
+// CherryPickOptions describes how a multi-commit cherry-pick sequence is
+// performed. A single CherryPickWithOptions call may cherry-pick several
+// commits; the sequence is recorded durably so it can be continued,
+// skipped or aborted if one of the commits stops with a conflict.
+type CherryPickOptions struct {
+	// CommitOptions carries the committer, signer and AllowEmptyCommits
+	// used for every picked commit. It must not be nil. The author of
+	// each picked commit is always taken from the original commit.
+	CommitOptions *CommitOptions
+	// Strategy selects how changes that overlap with the current branch
+	// are resolved. Defaults to TheirsMergeStrategy.
+	Strategy OrtMergeStrategyOption
+	// MainlineParent selects the parent (1-based) of a merge commit used
+	// as the three-way merge base, equivalent to `git cherry-pick -m`.
+	// It defaults to 1 and is ignored for ordinary (single-parent) and
+	// root (no-parent) commits.
+	MainlineParent int
+}
+
+// Validate validates the fields and sets the default values.
+func (o *CherryPickOptions) Validate() error {
+	if o.CommitOptions == nil {
+		return ErrCannotCherryPickWithoutCommitOptions
+	}
+	if o.MainlineParent <= 0 {
+		o.MainlineParent = 1
+	}
+	return nil
+}
 
 // AddOptions describes how an `add` operation should be performed
 type AddOptions struct {

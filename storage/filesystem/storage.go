@@ -36,6 +36,7 @@ type Storage struct {
 	ConfigStorage
 	ModuleStorage
 	ReflogStorage
+	SequenceStorage
 }
 
 // Compile-time assertions pin both *Storage and *dotgit.DotGit to
@@ -204,6 +205,7 @@ func NewStorageWithOptions(fs billy.Filesystem, c cache.Object, ops Options) *St
 		ConfigStorage:    ConfigStorage{dir: dir, objectFormat: ops.ObjectFormat},
 		ModuleStorage:    ModuleStorage{dir: dir, objectFormat: ops.ObjectFormat},
 		ReflogStorage:    ReflogStorage{dir: dir},
+		SequenceStorage:  NewSequenceStorage(fs),
 	}
 
 	return s

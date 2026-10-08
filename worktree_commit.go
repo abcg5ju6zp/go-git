@@ -17,7 +17,6 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/storage"
-	"github.com/go-git/go-git/v6/utils/merkletrie"
 	"github.com/go-git/go-git/v6/utils/trace"
 	"github.com/go-git/go-git/v6/x/plugin"
 )
@@ -106,100 +105,6 @@ func (w *Worktree) Commit(msg string, opts *CommitOptions) (plumbing.Hash, error
 	}
 
 	return commit, w.updateHEAD(commit)
-}
-
-// CherryPick cherry picks commits and merge them into the worktree based on the selected
-// merge strategy. Each commit sits on the top of worktree's current head.
-// It resembles `git cherry-pick <commit-hash-1> <commit-hash-2> ... --strategy-option [theirs,ours]`
-func (w *Worktree) CherryPick(commitOpts *CommitOptions, ortStrategyOption OrtMergeStrategyOption, commits ...*object.Commit) error {
-	if commitOpts == nil {
-		return ErrCannotCherryPickWithoutCommitOptions
-	}
-
-	cfg, err := w.r.Config()
-	if err != nil {
-		return err
-	}
-
-	// Materialise changes through the same validating filesystem and
-	// checkout path as reset/checkout, so cherry-pick shares their
-	// leading-symlink handling, mode awareness (symlinks, exec bits,
-	// CRLF) and root reuse instead of writing raw bytes via Create.
-	fs, closeFS := w.reusableRootFS()
-	defer closeFS()
-
-	for _, commit := range commits {
-		var changes object.Changes
-		headRef, err := w.r.Head()
-		if err != nil {
-			return err
-		}
-		headCommit, err := w.r.CommitObject(headRef.Hash())
-		if err != nil {
-			return err
-		}
-		currentTree, err := headCommit.Tree()
-		if err != nil {
-			return err
-		}
-
-		commitTree, err := commit.Tree()
-		if err != nil {
-			return err
-		}
-
-		switch ortStrategyOption {
-		case TheirsMergeStrategy:
-			changes, err = currentTree.Diff(commitTree)
-		case OursMergeStrategy:
-			changes, err = commitTree.Diff(currentTree)
-		}
-
-		if err != nil {
-			return err
-		}
-		for _, change := range changes {
-			action, err := change.Action()
-			if err != nil {
-				return err
-			}
-
-			switch action {
-			case merkletrie.Delete:
-				if _, err := w.Remove(change.From.Name); err != nil {
-					return err
-				}
-			case merkletrie.Insert, merkletrie.Modify:
-				_, to, err := change.Files()
-				if err != nil {
-					return err
-				}
-				if to == nil {
-					continue
-				}
-				// change.Files names the *File after the tree leaf. The
-				// worktree write needs the full path so it lands at the
-				// right location and is validated by the wrapper.
-				to.Name = change.To.Name
-				if err := w.checkoutFile(cfg, fs, to); err != nil {
-					return err
-				}
-				if _, err := w.Add(to.Name); err != nil {
-					return err
-				}
-			}
-		}
-		_, err = w.Commit(commit.Message, &CommitOptions{
-			Author:            &commit.Author,
-			Committer:         commitOpts.Committer,
-			Signer:            commitOpts.Signer,
-			AllowEmptyCommits: commitOpts.AllowEmptyCommits,
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (w *Worktree) autoAddModifiedAndDeleted() error {

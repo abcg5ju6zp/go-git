@@ -605,6 +605,15 @@ func (w *Worktree) fillEncodedObjectFromSymlink(dst io.Writer, path string, _ os
 }
 
 func (w *Worktree) addOrUpdateFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
+	// Resolving a conflicted path collapses its stage 1/2/3 entries into a
+	// single stage-0 entry, as `git add` does.
+	for _, e := range idx.Entries {
+		if e.Name == filename && e.Stage > 0 {
+			removeIndexEntries(idx, filename)
+			return w.doAddFileToIndex(idx, filename, h)
+		}
+	}
+
 	e, err := idx.Entry(filename)
 	if err != nil && !errors.Is(err, index.ErrEntryNotFound) {
 		return err
@@ -615,6 +624,23 @@ func (w *Worktree) addOrUpdateFileToIndex(idx *index.Index, filename string, h p
 	}
 
 	return w.doUpdateFileToIndex(e, filename, h)
+}
+
+// removeIndexEntries removes every index entry matching path (including
+// conflict stage entries) and reports how many were removed.
+func removeIndexEntries(idx *index.Index, path string) int {
+	path = filepath.ToSlash(path)
+	kept := idx.Entries[:0]
+	removed := 0
+	for _, e := range idx.Entries {
+		if e.Name == path {
+			removed++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	idx.Entries = kept
+	return removed
 }
 
 func (w *Worktree) doAddFileToIndex(idx *index.Index, filename string, h plumbing.Hash) error {
@@ -726,12 +752,23 @@ func (w *Worktree) doRemoveFile(idx *index.Index, path string) (plumbing.Hash, e
 }
 
 func (w *Worktree) deleteFromIndex(idx *index.Index, path string) (plumbing.Hash, error) {
-	e, err := idx.Remove(path)
-	if err != nil {
-		return plumbing.ZeroHash, err
+	// Resolving a conflicted path by deletion removes every stage entry,
+	// not just the first one.
+	var hash plumbing.Hash
+	found := false
+	for _, e := range idx.Entries {
+		if e.Name == filepath.ToSlash(path) {
+			if !found {
+				hash = e.Hash
+			}
+			found = true
+		}
 	}
-
-	return e.Hash, nil
+	if !found {
+		return plumbing.ZeroHash, index.ErrEntryNotFound
+	}
+	removeIndexEntries(idx, path)
+	return hash, nil
 }
 
 func (w *Worktree) deleteFromFilesystem(path string) error {
