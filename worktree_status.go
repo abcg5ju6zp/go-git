@@ -147,10 +147,14 @@ func (w *Worktree) diffStagingWithWorktree(cfg *config.Config, reverse, excludeI
 		return nil, err
 	}
 
+	return w.diffStagingWithWorktreeIndex(cfg, idx, reverse, excludeIgnoredChanges)
+}
+
+func (w *Worktree) diffStagingWithWorktreeIndex(cfg *config.Config, idx *index.Index, reverse, excludeIgnoredChanges bool) (merkletrie.Changes, error) {
 	from := mindex.NewRootNodeWithOptions(idx, mindex.RootNodeOptions{
 		UpholdExecutableBit: cfg.Core.FileMode,
 	})
-	submodules, err := w.getSubmodulesStatus(cfg)
+	submodules, err := w.getSubmodulesStatusIndex(cfg, idx)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +211,7 @@ func (w *Worktree) ignoreScope() *gitignore.Scope {
 	return gitignore.NewScope(patterns)
 }
 
-func (w *Worktree) getSubmodulesStatus(cfg *config.Config) (map[string]plumbing.Hash, error) {
+func (w *Worktree) getSubmodulesStatusIndex(cfg *config.Config, idx *index.Index) (map[string]plumbing.Hash, error) {
 	o := map[string]plumbing.Hash{}
 
 	sub, err := w.submodulesWithConfig(cfg)
@@ -215,18 +219,18 @@ func (w *Worktree) getSubmodulesStatus(cfg *config.Config) (map[string]plumbing.
 		return nil, err
 	}
 
-	status, err := sub.Status()
-	if err != nil {
-		return nil, err
-	}
+	for _, s := range sub {
+		status, err := s.status(idx)
+		if err != nil {
+			return nil, err
+		}
 
-	for _, s := range status {
-		if s.Current.IsZero() {
-			o[s.Path] = s.Expected
+		if status.Current.IsZero() {
+			o[status.Path] = status.Expected
 			continue
 		}
 
-		o[s.Path] = s.Current
+		o[status.Path] = status.Current
 	}
 
 	return o, nil
@@ -250,14 +254,18 @@ func (w *Worktree) diffCommitWithStaging(commit plumbing.Hash, reverse bool) (me
 }
 
 func (w *Worktree) diffTreeWithStaging(t *object.Tree, reverse bool) (merkletrie.Changes, error) {
-	var from noder.Noder
-	if t != nil {
-		from = object.NewTreeRootNode(t)
-	}
-
 	idx, err := w.r.Storer.Index()
 	if err != nil {
 		return nil, err
+	}
+
+	return diffTreeWithStagingIndex(t, idx, reverse)
+}
+
+func diffTreeWithStagingIndex(t *object.Tree, idx *index.Index, reverse bool) (merkletrie.Changes, error) {
+	var from noder.Noder
+	if t != nil {
+		from = object.NewTreeRootNode(t)
 	}
 
 	to := mindex.NewRootNode(idx)

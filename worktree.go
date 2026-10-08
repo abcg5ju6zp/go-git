@@ -59,6 +59,10 @@ type Worktree struct {
 
 	r          *Repository
 	filesystem *worktreeFilesystem
+
+	// checkoutFault, when non-nil, injects failures into Checkout for the
+	// transaction/recovery tests. Production code never sets it.
+	checkoutFault *checkoutFault
 }
 
 // Filesystem returns the underlying filesystem for the worktree.
@@ -181,7 +185,29 @@ func (w *Worktree) updateSubmodules(ctx context.Context, o *SubmoduleUpdateOptio
 }
 
 // Checkout switch branches or restore working tree files.
+//
+// The checkout runs as a transaction with four ordered phases:
+//
+//  1. The target commit/tree and the current worktree modifications are
+//     validated and the full set of changes is planned, without touching
+//     the disk (MergeReset aborts on unstaged changes, KeepReset aborts on
+//     local conflicts).
+//  2. Worktree entries are materialised in reversible steps. Every file,
+//     symlink or directory replaced or removed is moved into a per-checkout
+//     journal area first, so the phase can be unwound or resumed.
+//  3. The index is replaced atomically (temp file plus rename on disk, a
+//     pointer swap in memory) only after the worktree phase is verified.
+//  4. HEAD is updated last.
+//
+// A failure or cancellation in any phase rolls the worktree, index and
+// HEAD back to their pre-checkout state. If the process exits mid-checkout,
+// the on-disk journal lets the next Checkout either resume the interrupted
+// checkout (same target) or roll it back before switching elsewhere.
 func (w *Worktree) Checkout(opts *CheckoutOptions) error {
+	return w.checkoutContext(context.Background(), opts)
+}
+
+func (w *Worktree) checkoutContext(ctx context.Context, opts *CheckoutOptions) error {
 	if trace.Performance.Enabled() {
 		start := time.Now()
 		defer func() {
@@ -193,8 +219,12 @@ func (w *Worktree) Checkout(opts *CheckoutOptions) error {
 		return err
 	}
 
+	// Validate the -b request and resolve opts.Hash before any journal
+	// lookup: these checks are read-only; the branch reference itself is
+	// created during the commit phase, once the worktree and index are
+	// already consistent with its tree.
 	if opts.Create {
-		if err := w.createBranch(opts); err != nil {
+		if err := w.validateNewBranch(opts); err != nil {
 			return err
 		}
 	}
@@ -204,41 +234,43 @@ func (w *Worktree) Checkout(opts *CheckoutOptions) error {
 		return err
 	}
 
-	ro := &ResetOptions{
-		Commit:     c,
-		Mode:       MergeReset,
-		SparseDirs: opts.SparseCheckoutDirectories,
-	}
+	mode := MergeReset
 	if opts.Force {
-		ro.Mode = HardReset
+		mode = HardReset
 	} else if opts.Keep {
-		ro.Mode = SoftReset
+		mode = SoftReset
 	}
 
-	// For HardReset and KeepReset, capture the current tree BEFORE updating
-	// HEAD. This ensures resetWorktreeToTree correctly diffs from where we
-	// actually are, not from where HEAD will point after the update.
-	if ro.Mode == HardReset || ro.Mode == KeepReset {
-		ro.fromTree, err = w.headTree()
-		if err != nil {
-			return err
-		}
+	// Finish or undo a checkout interrupted by a previous run (crash or
+	// killed process) before starting a new one on this worktree.
+	if err := w.recoverInterruptedCheckout(ctx, c, mode, opts); err != nil {
+		return err
 	}
 
-	if !opts.Hash.IsZero() && !opts.Create {
-		err = w.setHEADToCommit(opts.Hash)
-	} else {
-		err = w.setHEADToBranch(opts.Branch, c)
-	}
-
+	tx, err := w.newCheckoutTx(ctx, opts, c, mode)
 	if err != nil {
 		return err
 	}
 
-	return w.Reset(ro)
+	if runErr := tx.run(); runErr != nil {
+		if tx.faultSimulatesCrash() {
+			// Tests ask for crash semantics: leave journal, backups and
+			// staging area exactly where they are for the next process.
+			return runErr
+		}
+		if rbErr := tx.rollback(); rbErr != nil {
+			return errors.Join(runErr, fmt.Errorf("checkout rollback failed: %w", rbErr))
+		}
+		return runErr
+	}
+	return nil
 }
 
-func (w *Worktree) createBranch(opts *CheckoutOptions) error {
+// validateNewBranch performs the read-only checks for a Checkout with
+// Create: the branch name must be valid, it must not exist yet, and
+// opts.Hash is defaulted to the current HEAD when unset. The reference
+// itself is written later, during the transaction's HEAD phase.
+func (w *Worktree) validateNewBranch(opts *CheckoutOptions) error {
 	// Git applies its branch-name rules to the shorthand a user types, so
 	// recover the shorthand before checking a name that is one. A name that is
 	// not under refs/heads/ gets the reference-name rules alone: handing it to
@@ -273,8 +305,15 @@ func (w *Worktree) createBranch(opts *CheckoutOptions) error {
 		opts.Hash = ref.Hash()
 	}
 
+	return nil
+}
+
+// createBranchReference writes the new branch reference. It runs during
+// the transaction's commit phase and assumes validateNewBranch already
+// approved the request.
+func (w *Worktree) createBranchReference(opts *CheckoutOptions, commit plumbing.Hash) error {
 	return w.r.Storer.SetReference(
-		plumbing.NewHashReference(opts.Branch, opts.Hash),
+		plumbing.NewHashReference(opts.Branch, commit),
 	)
 }
 
@@ -487,19 +526,40 @@ func (w *Worktree) resetIndex(t *object.Tree, dirs, files []string) ([]string, e
 		return nil, err
 	}
 
-	b := newIndexBuilder(idx)
-
-	changes, err := w.diffTreeWithStaging(t, true)
+	idx, removedFiles, err := buildResetIndex(idx, t, dirs, files)
 	if err != nil {
 		return nil, err
 	}
+
+	return removedFiles, w.r.Storer.SetIndex(idx)
+}
+
+// buildResetIndex computes the index that results from resetting to t
+// without persisting it. The returned index owns private copies of every
+// entry, so later mutation (SkipUnless, stat refresh) never aliases the
+// caller's index. removedFiles lists every path touched by the reset
+// (inserts, modifies and deletes), matching resetIndex's historical result.
+func buildResetIndex(oldIdx *index.Index, t *object.Tree, dirs, files []string) (*index.Index, []string, error) {
+	changes, err := diffTreeWithStagingIndex(t, oldIdx, true)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	idx := *oldIdx
+	idx.Entries = make([]*index.Entry, len(oldIdx.Entries))
+	for i, e := range oldIdx.Entries {
+		cp := *e
+		idx.Entries[i] = &cp
+	}
+
+	b := newIndexBuilder(&idx)
 
 	removedFiles := make([]string, 0, len(changes))
 	filesMap := buildFilePathMap(files)
 	for _, ch := range changes {
 		a, err := ch.Action()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		var name string
@@ -510,7 +570,7 @@ func (w *Worktree) resetIndex(t *object.Tree, dirs, files []string) ([]string, e
 			name = ch.To.String()
 			e, err = t.FindEntry(name)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		case merkletrie.Delete:
 			name = ch.From.String()
@@ -536,13 +596,13 @@ func (w *Worktree) resetIndex(t *object.Tree, dirs, files []string) ([]string, e
 		})
 	}
 
-	b.Write(idx)
+	b.Write(&idx)
 
 	if len(dirs) > 0 {
 		idx.SkipUnless(dirs)
 	}
 
-	return removedFiles, w.r.Storer.SetIndex(idx)
+	return &idx, removedFiles, nil
 }
 
 // inFiles checks if the given file is in the list of files. The incoming filepaths in files should be cleaned before calling this function.
@@ -982,8 +1042,12 @@ func (w *Worktree) checkoutChangeRegularFile(cfg *config.Config,
 		idx.Remove(name)
 
 		// to apply perm changes the file is deleted, billy doesn't implement
-		// chmod
-		if err := fs.Remove(name); err != nil {
+		// chmod. A missing entry is tolerated: the insert below materialises
+		// it either way, and a transactional checkout resumed after a crash
+		// must be able to replay this step once the file was already moved
+		// aside. This mirrors git, which writes the target content whenever
+		// the worktree side is absent.
+		if err := fs.Remove(name); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 
