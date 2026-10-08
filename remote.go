@@ -84,6 +84,14 @@ func (r *Remote) Push(o *PushOptions) error {
 	return r.PushContext(context.Background(), o)
 }
 
+// PushResult performs a push and additionally returns the per-reference
+// outcome (pending, accepted or rejected). Its error return is identical
+// to Push's; the result is populated even when the error is non-nil, so a
+// partial failure can be inspected.
+func (r *Remote) PushResult(o *PushOptions) (*PushResult, error) {
+	return r.PushContextResult(context.Background(), o)
+}
+
 // PushContext performs a push to the remote. Returns NoErrAlreadyUpToDate if
 // the remote was already up-to-date.
 // Malformed wildcard source patterns are rejected before contacting the remote.
@@ -91,7 +99,17 @@ func (r *Remote) Push(o *PushOptions) error {
 // The provided Context must be non-nil. If the context expires before the
 // operation is complete, an error is returned. The context only affects the
 // transport operations.
-func (r *Remote) PushContext(ctx context.Context, o *PushOptions) (err error) {
+func (r *Remote) PushContext(ctx context.Context, o *PushOptions) error {
+	_, err := r.PushContextResult(ctx, o)
+	return err
+}
+
+// PushContextResult is PushContext with the per-reference result added.
+//
+// The provided Context must be non-nil. If the context expires before the
+// operation is complete, an error is returned. The context only affects the
+// transport operations.
+func (r *Remote) PushContextResult(ctx context.Context, o *PushOptions) (result *PushResult, err error) {
 	if trace.Performance.Enabled() {
 		start := time.Now()
 		defer func() {
@@ -100,7 +118,7 @@ func (r *Remote) PushContext(ctx context.Context, o *PushOptions) (err error) {
 	}
 
 	if err := o.Validate(); err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, spec := range o.RefSpecs {
@@ -116,44 +134,66 @@ func (r *Remote) PushContext(ctx context.Context, o *PushOptions) (err error) {
 			name = plumbing.RefPrefix + name
 		}
 		if err := plumbing.ReferenceName(name).Validate(); err != nil {
-			return fmt.Errorf("%w: invalid source pattern %q", plumbing.ErrInvalidReferenceName, spec.Src())
+			return nil, fmt.Errorf("%w: invalid source pattern %q", plumbing.ErrInvalidReferenceName, spec.Src())
 		}
 	}
 
 	if o.RemoteName != r.c.Name {
-		return fmt.Errorf("remote names don't match: %s != %s", o.RemoteName, r.c.Name)
+		return nil, fmt.Errorf("remote names don't match: %s != %s", o.RemoteName, r.c.Name)
 	}
 
 	if o.RemoteURL == "" && len(r.c.URLs) > 0 {
 		o.RemoteURL = r.c.URLs[len(r.c.URLs)-1]
 	}
 
+	// Replay the durable outcome of a push that never read its final
+	// report (disconnect, cancellation, process exit): accepted refs are
+	// applied to the tracking refs now, before any network I/O.
+	carried, carriedSince, err := r.recoverPushTransaction(r.c.Name, o.RemoteURL)
+	if err != nil {
+		return nil, err
+	}
+
 	cl, req, err := newClient(o.RemoteURL, o.ClientOptions)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	req.Command = transport.ReceivePackService
 	sess, err := cl.Handshake(ctx, req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer ioutil.CheckClose(sess, &err)
 
 	rRefs, err := sess.GetRemoteRefs(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	remoteRefs := referenceStorageFromRefs(rRefs.References, true)
 	if err := r.checkRequireRemoteRefs(o.RequireRemoteRefs, remoteRefs); err != nil {
-		return err
+		return nil, err
 	}
 
-	return r.sendPack(ctx, sess, remoteRefs, o)
+	// Pending updates whose end state is already on the remote are
+	// confirmed from the advertisement, so an interrupted push whose
+	// retry needs nothing to send still repairs the tracking refs.
+	carried, err = r.confirmPendingFromAdvertisement(r.c.Name, o.RemoteURL, carriedSince, carried, remoteRefs)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.sendPack(ctx, sess, remoteRefs, o, carried)
 }
 
-func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRefs storer.ReferenceStorer, o *PushOptions) error {
+func (r *Remote) sendPack(
+	ctx context.Context,
+	sess transport.Session,
+	remoteRefs storer.ReferenceStorer,
+	o *PushOptions,
+	carried []storer.PushRefUpdate,
+) (*PushResult, error) {
 	isDelete := false
 	allDelete := true
 	for _, rs := range o.RefSpecs {
@@ -170,7 +210,7 @@ func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRef
 	// TODO: support delete-refs
 	caps := sess.Capabilities() // server capabilities
 	if isDelete && !caps.Supports(capability.DeleteRefs) {
-		return ErrDeleteRefNotSupported
+		return nil, ErrDeleteRefNotSupported
 	}
 
 	if o.Force {
@@ -184,7 +224,7 @@ func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRef
 
 	localRefs, err := reference.References(r.s)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Storage enumeration is also used by repository maintenance and must
 	// remain complete. Only push candidates exclude malformed ordinary refs,
@@ -198,7 +238,7 @@ func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRef
 				// mapped destination. Wildcards still skip malformed entries.
 				for _, spec := range o.RefSpecs {
 					if !spec.IsWildcard() && spec.Match(ref.Name()) {
-						return err
+						return nil, err
 					}
 				}
 				continue
@@ -210,35 +250,35 @@ func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRef
 
 	cmds := make([]*packp.Command, 0)
 	if err := r.addReferencesToUpdate(o.RefSpecs, localRefs, remoteRefs, &cmds, o.Prune, o.ForceWithLease); err != nil {
-		return err
+		return nil, err
 	}
 
 	if o.FollowTags {
 		if err := r.addReachableTags(localRefs, remoteRefs, &cmds); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	// Refspecs can turn a valid source into an invalid destination. Validate
 	// the complete command list before any update is sent to the remote.
 	for _, cmd := range cmds {
 		if err := cmd.Name.Validate(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	if len(cmds) == 0 {
-		return NoErrAlreadyUpToDate
+		return &PushResult{}, NoErrAlreadyUpToDate
 	}
 
 	objects := objectsToPush(cmds)
 	haves, err := referencesToHashes(remoteRefs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	stop, err := r.s.Shallow()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// if we have shallow we should include this as part of the objects that
@@ -250,7 +290,7 @@ func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRef
 	if !allDelete {
 		hashesToPush, err = revlist.Objects(r.s, objects, haves)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -264,11 +304,31 @@ func (r *Remote) sendPack(ctx context.Context, sess transport.Session, remoteRef
 		}
 	}
 
-	if err := pushHashes(ctx, sess, r.s, cmds, hashesToPush, allDelete, o); err != nil {
-		return err
+	// Record every command as pending before the request is written so a
+	// crash while the remote applies them leaves a recoverable record.
+	started := r.recordPendingPushTransaction(r.c.Name, o.RemoteURL, carried, cmds)
+
+	report := &transport.PushReport{}
+	pushErr := pushHashes(ctx, sess, r.s, cmds, hashesToPush, allDelete, o, report)
+
+	// Persist the definitive outcomes before touching any tracking ref:
+	// a crash between this point and the local updates below leaves the
+	// accepted references in the journal for the next push to replay.
+	r.recordPushOutcomes(r.c.Name, o.RemoteURL, started, carried, report)
+
+	// The report is authoritative per reference even when the push
+	// returned an error: a batch may have been partially accepted before
+	// a rejection or a disconnect. Tracking refs move only for refs the
+	// remote explicitly reported "ok" for.
+	if trackingErr := r.applyAcceptedReport(report); trackingErr != nil {
+		// Keep the outcomes journal in place so the failed tracking update
+		// is retried through compare-and-set on the next push.
+		return newPushResult(report), errors.Join(pushErr, trackingErr)
 	}
 
-	return r.updateRemoteReferenceStorage(cmds)
+	r.finalizePushTransaction(r.c.Name, o.RemoteURL, started, carried, cmds, report)
+
+	return newPushResult(report), pushErr
 }
 
 func (r *Remote) useRefDeltas(ar *packp.AdvRefs) bool {
@@ -336,33 +396,6 @@ func (r *Remote) addReachableTags(localRefs []*plumbing.Reference, remoteRefs st
 
 			if isAncestor, err := tagCommit.IsAncestor(c); err == nil && isAncestor {
 				*cmds = append(*cmds, &packp.Command{Name: tag.Name(), New: tag.Hash()})
-			}
-		}
-	}
-
-	return nil
-}
-
-func (r *Remote) updateRemoteReferenceStorage(
-	cmds []*packp.Command,
-) error {
-	for _, spec := range r.c.Fetch {
-		for _, c := range cmds {
-			if !spec.Match(c.Name) {
-				continue
-			}
-
-			local := spec.Dst(c.Name)
-			ref := plumbing.NewHashReference(local, c.New)
-			switch c.Action() {
-			case packp.Create, packp.Update:
-				if err := r.s.SetReference(ref); err != nil {
-					return err
-				}
-			case packp.Delete:
-				if err := r.s.RemoveReference(local); err != nil {
-					return err
-				}
 			}
 		}
 	}
@@ -1689,6 +1722,7 @@ func pushHashes(
 	hs []plumbing.Hash,
 	allDelete bool,
 	o *PushOptions,
+	report *transport.PushReport,
 ) error {
 	useRefDeltas := !sess.Capabilities().Supports(capability.OFSDelta)
 	rd, wr := io.Pipe()
@@ -1708,6 +1742,7 @@ func pushHashes(
 		Options:  o.Options,
 		Atomic:   o.Atomic,
 		Quiet:    o.Quiet,
+		Report:   report,
 	}
 
 	if !allDelete {

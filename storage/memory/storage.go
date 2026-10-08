@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v6/config"
@@ -35,6 +36,9 @@ type Storage struct {
 	ModuleStorage
 	ReflogStorage
 	options options
+
+	pushMu  sync.Mutex
+	pushTxn map[string]*storer.PushTransaction
 }
 
 // NewStorage returns a new in memory Storage base.
@@ -60,6 +64,7 @@ func NewStorage(o ...StorageOption) *Storage {
 		ReflogStorage: ReflogStorage{
 			entries: make(map[plumbing.ReferenceName][]*reflog.Entry),
 		},
+		pushTxn: make(map[string]*storer.PushTransaction),
 	}
 
 	if opts.objectFormat != formatcfg.UnsetObjectFormat {

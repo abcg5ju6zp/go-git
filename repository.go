@@ -1466,6 +1466,12 @@ func (r *Repository) Push(o *PushOptions) error {
 	return r.PushContext(context.Background(), o)
 }
 
+// PushResult performs a push and additionally returns the per-reference
+// outcome. Its error return is identical to Push's.
+func (r *Repository) PushResult(o *PushOptions) (*PushResult, error) {
+	return r.PushContextResult(context.Background(), o)
+}
+
 // PushContext performs a push to the remote. Returns NoErrAlreadyUpToDate if
 // the remote was already up-to-date, from the remote named as
 // FetchOptions.RemoteName.
@@ -1474,16 +1480,26 @@ func (r *Repository) Push(o *PushOptions) error {
 // operation is complete, an error is returned. The context only affects the
 // transport operations.
 func (r *Repository) PushContext(ctx context.Context, o *PushOptions) error {
+	_, err := r.PushContextResult(ctx, o)
+	return err
+}
+
+// PushContextResult is PushContext with the per-reference result added.
+//
+// The provided Context must be non-nil. If the context expires before the
+// operation is complete, an error is returned. The context only affects the
+// transport operations.
+func (r *Repository) PushContextResult(ctx context.Context, o *PushOptions) (*PushResult, error) {
 	if err := o.Validate(); err != nil {
-		return err
+		return nil, err
 	}
 
 	remote, err := r.Remote(o.RemoteName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return remote.PushContext(ctx, o)
+	return remote.PushContextResult(ctx, o)
 }
 
 // ArchiveOptions stores the options for the Archive operation.

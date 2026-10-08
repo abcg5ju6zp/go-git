@@ -36,6 +36,12 @@ type Options struct {
 	// Loader resolves URLs to storage.Storer instances. If nil,
 	// transport.DefaultLoader is used.
 	Loader transport.Loader
+
+	// ReceivePack overrides the receive-pack server implementation. It
+	// is intended for tests that need to script server behavior (a
+	// truncated report, an injected failure) while keeping the real
+	// in-process repository. When nil, the default ReceivePack is used.
+	ReceivePack ServerFunc
 }
 
 // Transport implements the file:// transport protocol.
@@ -52,10 +58,14 @@ func NewTransport(opts Options) *Transport {
 	if loader == nil {
 		loader = transport.DefaultLoader
 	}
+	receivePack := defaultReceivePack
+	if opts.ReceivePack != nil {
+		receivePack = opts.ReceivePack
+	}
 	return &Transport{
 		loader:        loader,
 		uploadPack:    defaultUploadPack,
-		receivePack:   defaultReceivePack,
+		receivePack:   receivePack,
 		uploadArchive: defaultUploadArchive,
 	}
 }

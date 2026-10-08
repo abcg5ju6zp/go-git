@@ -6,8 +6,10 @@ import (
 	"net"
 
 	internal "github.com/go-git/go-git/v6/internal/transport"
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
+	"github.com/go-git/go-git/v6/plumbing/storer"
 )
 
 // DialContextFunc is the function signature for dialing network connections.
@@ -75,4 +77,88 @@ type PushRequest struct {
 	// Quiet indicates whether the server should suppress human-readable
 	// output.
 	Quiet bool
+
+	// Report, when non-nil, is filled with the per-reference outcome of
+	// the push. It is initialized with one pending entry per command
+	// before anything is written, and entries are promoted to accepted
+	// or rejected as the remote report-status is read. If the report
+	// cannot be read completely (disconnect, context cancellation,
+	// protocol error), references without a status line stay pending and
+	// the entries decoded so far are retained.
+	Report *PushReport
+}
+
+// RefStatus is the outcome of one reference update within a push.
+type RefStatus struct {
+	// Name is the reference the update targets, as sent to the remote.
+	Name plumbing.ReferenceName
+	// Old is the value the remote was expected to hold before the update.
+	Old plumbing.Hash
+	// New is the requested new value; zero for a delete.
+	New plumbing.Hash
+	// State is pending, accepted or rejected.
+	State storer.RefUpdateState
+	// Reason is the server-provided rejection reason for rejected updates.
+	Reason string
+}
+
+// PushReport is the per-reference result of a push. The Refs slice follows
+// the order of PushRequest.Commands.
+type PushReport struct {
+	// UnpackStatus is the unpack line reported by the remote: "ok" on
+	// success or the server-provided failure reason. It is empty when
+	// the server did not negotiate report-status; such a server never
+	// confirms references, so a clean exchange is optimistically
+	// recorded as all accepted, matching the pre-report behavior.
+	UnpackStatus string
+	// Refs are the per-command outcomes in command order.
+	Refs []RefStatus
+}
+
+// reset seeds the report with one pending entry per command.
+func (r *PushReport) reset(cmds []*packp.Command) {
+	r.UnpackStatus = ""
+	r.Refs = make([]RefStatus, len(cmds))
+	for i, cmd := range cmds {
+		r.Refs[i] = RefStatus{
+			Name:  cmd.Name,
+			Old:   cmd.Old,
+			New:   cmd.New,
+			State: storer.RefUpdatePending,
+		}
+	}
+}
+
+// markAll sets every entry to state.
+func (r *PushReport) markAll(state storer.RefUpdateState) {
+	for i := range r.Refs {
+		r.Refs[i].State = state
+	}
+}
+
+// Accepted returns the references the remote reported "ok" for, in
+// command order.
+func (r *PushReport) Accepted() []RefStatus {
+	return r.refsInState(storer.RefUpdateAccepted)
+}
+
+// Rejected returns the references the remote refused, in command order.
+func (r *PushReport) Rejected() []RefStatus {
+	return r.refsInState(storer.RefUpdateRejected)
+}
+
+// Pending returns the updates that were sent but never got a definitive
+// status line, in command order.
+func (r *PushReport) Pending() []RefStatus {
+	return r.refsInState(storer.RefUpdatePending)
+}
+
+func (r *PushReport) refsInState(state storer.RefUpdateState) []RefStatus {
+	var out []RefStatus
+	for _, ref := range r.Refs {
+		if ref.State == state {
+			out = append(out, ref)
+		}
+	}
+	return out
 }
